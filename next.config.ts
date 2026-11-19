@@ -13,9 +13,10 @@ const nextConfig: NextConfig = {
   },
   // puppeteer-core and @sparticuz/chromium are kept out of the bundle automatically.
   // Chromium's compressed binary is read from disk at runtime, which the file tracer
-  // can miss, so it is listed explicitly for the screenshot route.
+  // can miss, so it is listed explicitly for the screenshot route, along with
+  // the extra fonts in /fonts (see src/lib/browser.ts).
   outputFileTracingIncludes: {
-    "/api/shot": ["./node_modules/@sparticuz/chromium/bin/**/*"],
+    "/api/shot": ["./node_modules/@sparticuz/chromium/bin/**/*", "./fonts/**/*"],
   },
 };
 

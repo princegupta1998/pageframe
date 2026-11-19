@@ -18,9 +18,18 @@ export const WP_PAGES = [
 
 type Found = Partial<Record<(typeof WP_PAGES)[number][0], string>>;
 
+// Unique query parameter + no-cache headers: Cloudflare, Nginx and LiteSpeed caches
+// treat it as a page they've never seen and ask WordPress for a fresh answer.
+const NO_CACHE_HEADERS = { "Cache-Control": "no-cache", Pragma: "no-cache" };
+const bust = (url: string) => {
+  const u = new URL(url);
+  u.searchParams.set("pf_nocache", Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  return u.toString();
+};
+
 async function getJSON(url: string): Promise<unknown> {
   try {
-    const { res } = await safeFetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
+    const { res } = await safeFetch(bust(url), { headers: { "User-Agent": UA, Accept: "application/json", ...NO_CACHE_HEADERS } });
     if (!res.ok) { await res.body?.cancel(); return null; }
     return JSON.parse(await res.text());
   } catch {
@@ -88,7 +97,7 @@ export async function discoverWordPress(siteUrl: string): Promise<Found> {
   // Users API blocked by a security plugin? Read the author link from the post's HTML.
   if (post?.link && !found.author) {
     try {
-      const { res } = await safeFetch(post.link, { headers: { "User-Agent": UA } });
+      const { res } = await safeFetch(bust(post.link), { headers: { "User-Agent": UA, ...NO_CACHE_HEADERS } });
       const m = (await res.text()).match(/href=["']([^"']+\/author\/[^"'#?]+)["']/i);
       if (m) found.author = m[1];
     } catch {}

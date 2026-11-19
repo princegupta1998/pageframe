@@ -1,5 +1,6 @@
 export interface CaptureOptions {
   fullPage: boolean;
+  noCache: boolean;
   quality: number;
   retina: boolean;
   dark: boolean;
@@ -11,6 +12,7 @@ export interface CaptureOptions {
 
 export const DEFAULT_OPTIONS: CaptureOptions = {
   fullPage: true,
+  noCache: true,
   quality: 80,
   retina: false,
   dark: false,
@@ -28,6 +30,7 @@ export function sanitizeOptions(raw: unknown): CaptureOptions {
   const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   return {
     fullPage: o.fullPage !== false,
+    noCache: o.noCache !== false,
     quality: clamp(Number(o.quality) || 80, 40, 95),
     retina: o.retina === true,
     dark: o.dark === true,

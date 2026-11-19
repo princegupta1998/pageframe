@@ -298,6 +298,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
             <div className="mt-4 grid gap-x-6 gap-y-3 sm:grid-cols-2">
               {([
                 ["fullPage", "Capture the whole page, top to bottom"],
+                ["noCache", "Skip all caches (get the live, fresh version)"],
                 ["blockAds", "Block ads and trackers"],
                 ["hideCookies", "Hide cookie banners and popups"],
                 ["dark", "Dark mode, on sites that support it"],

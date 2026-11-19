@@ -1,5 +1,5 @@
 import "server-only";
-import type { Browser, HTTPRequest } from "puppeteer-core";
+import type { Browser, HTTPRequest, Page } from "puppeteer-core";
 import type { Device } from "./devices";
 import type { CaptureOptions } from "./options";
 import { hostIsSafe } from "./guard";
@@ -20,11 +20,19 @@ const COOKIE_SELECTORS = [
   ".elementor-popup-modal", ".dialog-lightbox-widget", ".pum-overlay",
 ];
 
-// Without this, Elementor entrance animations leave sections invisible and
-// half-finished transitions get frozen into the image.
+/**
+ * Makes the page look "settled", the way a visitor sees it after a few seconds:
+ * - animations and transitions finish instantly instead of being caught halfway
+ * - Elementor, AOS and WOW.js entrance animations are shown instead of staying invisible
+ * - content-visibility:auto is turned off: Chrome skips drawing those sections when
+ *   they are outside the screen, which leaves blank holes in full-page screenshots
+ */
 const BASE_CSS = `
 *,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;transition:none!important;scroll-behavior:auto!important;caret-color:transparent!important}
+*{content-visibility:visible!important}
 .elementor-invisible{visibility:visible!important;opacity:1!important}
+[data-aos]{opacity:1!important;transform:none!important}
+.wow{visibility:visible!important}
 body.dialog-prevent-scroll{overflow:auto!important}
 `;
 
@@ -34,6 +42,99 @@ function buildCss(opts: CaptureOptions) {
     ...opts.hideSelectors.split("\n").map((s) => s.trim()).filter(Boolean),
   ];
   return BASE_CSS + hide.map((s) => `${s}{display:none!important}`).join("\n");
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const bareHost = (h: string) => h.toLowerCase().replace(/^www\./, "");
+
+/**
+ * WP Rocket ("Delay JavaScript execution"), LiteSpeed, Perfmatters and FlyingPress
+ * don't run a site's JavaScript until a real visitor moves the mouse, touches the
+ * screen or presses a key. Until then: no carousels, no sliders, no Elementor lazy
+ * backgrounds. So we behave like a visitor first, then wait for those scripts.
+ */
+async function actLikeAVisitor(page: Page, device: Device) {
+  const x = Math.round(device.width / 2);
+  const y = Math.min(300, Math.round(device.height / 2));
+  await page.mouse.move(x, y).catch(() => {});
+  await page.mouse.move(x + 40, y + 30, { steps: 4 }).catch(() => {});
+  await page.mouse.wheel({ deltaY: 120 }).catch(() => {});
+  await page.keyboard.press("Shift").catch(() => {});
+  await page.evaluate(() => {
+    for (const type of ["touchstart", "touchmove", "touchend"]) window.dispatchEvent(new Event(type));
+  }).catch(() => {});
+  // Park the mouse at the bottom-left edge so no menu stays open from hovering
+  await page.mouse.move(0, device.height - 1).catch(() => {});
+  await page.evaluate(() => scrollTo(0, 0)).catch(() => {});
+  await page.waitForNetworkIdle({ idleTime: 700, timeout: 10_000 }).catch(() => {});
+}
+
+/**
+ * Lazy-loading plugins keep the real image address in data-src / data-lazy-src
+ * and swap it in when the image scrolls into view. Swap them all in now, and
+ * mark Elementor containers as loaded so their background images appear.
+ */
+async function revealLazyContent(page: Page) {
+  await page.evaluate(() => {
+    const isPlaceholder = (src: string | null) =>
+      !src || src.startsWith("data:") || /lazy|placeholder|blank\.(gif|png)/i.test(src);
+
+    document.querySelectorAll<HTMLImageElement>("img").forEach((img) => {
+      img.loading = "eager";
+      const real = img.getAttribute("data-lazy-src") || img.getAttribute("data-src");
+      const set = img.getAttribute("data-lazy-srcset") || img.getAttribute("data-srcset");
+      if (real && isPlaceholder(img.getAttribute("src"))) {
+        if (set) img.srcset = set;
+        img.src = real;
+      }
+    });
+    document.querySelectorAll<HTMLSourceElement>("picture source").forEach((s) => {
+      const set = s.getAttribute("data-lazy-srcset") || s.getAttribute("data-srcset");
+      if (set) s.srcset = set;
+    });
+    document.querySelectorAll<HTMLIFrameElement>("iframe").forEach((f) => {
+      f.loading = "eager";
+      const real = f.getAttribute("data-lazy-src") || f.getAttribute("data-src");
+      if (real && (!f.getAttribute("src") || f.src === "about:blank")) f.src = real;
+    });
+    document.querySelectorAll<HTMLElement>("[data-bg], [data-lazy-background], [data-background-image], [data-bg-image]").forEach((el) => {
+      const bg = el.getAttribute("data-bg") || el.getAttribute("data-lazy-background")
+        || el.getAttribute("data-background-image") || el.getAttribute("data-bg-image");
+      if (bg && !el.style.backgroundImage) el.style.backgroundImage = bg.startsWith("url(") ? bg : `url("${bg}")`;
+    });
+    // Elementor hides container backgrounds until .e-lazyloaded is added
+    document.querySelectorAll(".e-con, .elementor-section, .elementor-column, [data-e-bg-lazyload]")
+      .forEach((el) => el.classList.add("e-lazyloaded"));
+    // lazysizes and similar libraries
+    document.querySelectorAll(".lazyload, .lazy").forEach((el) => el.classList.add("lazyloaded"));
+  }).catch(() => {});
+}
+
+/** Waits for images, CSS background images and web fonts, at most 10 seconds. */
+async function waitForVisuals(page: Page) {
+  await page.evaluate(async () => {
+    const bgUrls = new Set<string>();
+    const all = document.querySelectorAll<HTMLElement>("body *");
+    for (let i = 0; i < all.length && bgUrls.size < 300; i++) {
+      const bg = getComputedStyle(all[i]).backgroundImage;
+      if (!bg || bg === "none") continue;
+      for (const m of bg.matchAll(/url\(["']?(.*?)["']?\)/g)) if (!m[1].startsWith("data:")) bgUrls.add(m[1]);
+    }
+    const pending = Array.from(document.images).filter((i) => !i.complete);
+    await Promise.race([
+      Promise.all([
+        document.fonts?.ready,
+        ...pending.map((i) => new Promise((r) => {
+          i.addEventListener("load", r, { once: true });
+          i.addEventListener("error", r, { once: true });
+        })),
+        // Loading the same URL again is served from the browser's memory, so this
+        // finishes when the background image itself has arrived.
+        ...Array.from(bgUrls).map((u) => new Promise((r) => { const im = new Image(); im.onload = im.onerror = r; im.src = u; })),
+      ]),
+      new Promise((r) => setTimeout(r, 10_000)),
+    ]);
+  }).catch(() => {});
 }
 
 export interface ShotResult {
@@ -48,10 +149,18 @@ export async function captureShot(
   { url, device, opts }: { url: string; device: Device; opts: CaptureOptions },
 ): Promise<ShotResult> {
   // Normally a fresh, isolated context per screenshot. In single-process mode
-  // (serverless) contexts aren't possible, so use a tab and clear cookies after.
+  // (serverless) contexts aren't possible, so use a tab and clear everything first.
   const context = singleProcess ? null : await browser.createBrowserContext();
   const page = context ? await context.newPage() : await browser.newPage();
+  const siteHost = bareHost(new URL(url).hostname);
+  const bustValue = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
   try {
+    // Start with an empty browser cache and no cookies, every time
+    const cdp = await page.createCDPSession();
+    await cdp.send("Network.clearBrowserCache").catch(() => {});
+    await cdp.send("Network.clearBrowserCookies").catch(() => {});
+
     await page.setViewport({
       width: device.width,
       height: device.height,
@@ -64,7 +173,7 @@ export async function captureShot(
     await page.setBypassCSP(true);
     await page.setBypassServiceWorker(true);
 
-    // Every request the page makes passes through here: ads blocked, private IPs blocked.
+    // Every request the page makes passes through here
     await page.setRequestInterception(true);
     const handle = async (req: HTTPRequest) => {
       if (req.isInterceptResolutionHandled()) return;
@@ -73,37 +182,55 @@ export async function captureShot(
       if (u.protocol !== "http:" && u.protocol !== "https:") return req.continue();
       if (opts.blockAds && AD_HOSTS.test(u.hostname)) return req.abort("blockedbyclient");
       if (!(await hostIsSafe(u.hostname))) return req.abort("blockedbyclient");
+
+      // Skip caches: the site's own HTML, CSS and JS get a unique ?pf_nocache= value,
+      // so Cloudflare, Nginx/RunCloud, LiteSpeed and WP Rocket can't answer from a
+      // stored copy. The page itself still sees its normal URL.
+      const sameSite = bareHost(u.hostname) === siteHost || u.hostname.endsWith("." + siteHost);
+      const type = req.resourceType();
+      if (opts.noCache && sameSite && (type === "document" || type === "stylesheet" || type === "script")) {
+        u.searchParams.set("pf_nocache", bustValue);
+        const isMainPage = req.isNavigationRequest() && req.frame() === page.mainFrame();
+        return req.continue({
+          url: u.toString(),
+          // Extra no-cache headers only on the page itself: adding them to other files
+          // could trigger cross-origin checks that block fonts and scripts
+          headers: isMainPage ? { ...req.headers(), "cache-control": "no-cache", pragma: "no-cache" } : undefined,
+        });
+      }
       return req.continue();
     };
     page.on("request", (req) => { handle(req).catch(() => {}); });
 
+    // 1. Load the page
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40_000 });
-    await page.waitForNetworkIdle({ idleTime: 600, timeout: 12_000 }).catch(() => {});
-    await page.addStyleTag({ content: buildCss(opts) }).catch(() => {});
+    await page.waitForNetworkIdle({ idleTime: 600, timeout: 10_000 }).catch(() => {});
 
-    // Scroll down step by step so lazy-loaded images (WP Rocket, LiteSpeed,
-    // loading="lazy", Elementor lazy backgrounds) actually load.
+    // 2. Behave like a visitor so delayed JavaScript (carousels, sliders...) runs
+    await actLikeAVisitor(page, device);
+
+    // 3. Settle animations, reveal lazy content
+    await page.addStyleTag({ content: buildCss(opts) }).catch(() => {});
+    await revealLazyContent(page);
+
+    // 4. Scroll through the page slowly so scroll-triggered content appears
     await page.evaluate(async () => {
-      document.querySelectorAll<HTMLImageElement>('img[loading="lazy"]').forEach((i) => { i.loading = "eager"; });
       const step = Math.max(300, innerHeight * 0.85);
-      for (let y = 0, n = 0; y < document.documentElement.scrollHeight && n < 80; y += step, n++) {
+      for (let y = 0, n = 0; y < document.documentElement.scrollHeight && n < 100; y += step, n++) {
         scrollTo(0, y);
-        await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 140));
       }
       scrollTo(0, 0);
-    });
+    }).catch(() => {});
 
-    // Wait for images and web fonts, at most 8 seconds
-    await page.evaluate(() => Promise.race([
-      Promise.all([
-        document.fonts?.ready,
-        ...Array.from(document.images).filter((i) => !i.complete)
-          .map((i) => new Promise((r) => { i.onload = i.onerror = r; })),
-      ]),
-      new Promise((r) => setTimeout(r, 8000)),
-    ])).catch(() => {});
-    await new Promise((r) => setTimeout(r, 500 + opts.delay));
+    // 5. Anything added by JavaScript during the scroll gets revealed too, then wait for it all
+    await revealLazyContent(page);
+    await page.waitForNetworkIdle({ idleTime: 500, timeout: 6_000 }).catch(() => {});
+    await waitForVisuals(page);
+    await page.evaluate(() => scrollTo(0, 0)).catch(() => {});
+    await sleep(500 + opts.delay);
 
+    // 6. Capture
     const pageHeight = await page.evaluate(() =>
       Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0));
     // Retina doubles every pixel, so it gets half the height to stay within limits
@@ -111,7 +238,7 @@ export async function captureShot(
     const height = opts.fullPage ? Math.min(pageHeight, maxHeight) : device.height;
     const clip = { x: 0, y: 0, width: device.width, height };
 
-    // Very long pages can exceed the 4.5 MB response limit: lower JPEG quality until it fits.
+    // Very long pages can exceed the 4.5 MB response limit: lower JPEG quality until it fits
     let quality = opts.quality;
     let buffer = await page.screenshot({ type: "jpeg", quality, clip, captureBeyondViewport: true });
     while (buffer.byteLength > MAX_BYTES && quality > 40) {
@@ -127,8 +254,6 @@ export async function captureShot(
     if (context) {
       await context.close().catch(() => {});
     } else {
-      const cdp = await page.createCDPSession().catch(() => null);
-      await cdp?.send("Network.clearBrowserCookies").catch(() => {});
       await page.close().catch(() => {});
     }
   }

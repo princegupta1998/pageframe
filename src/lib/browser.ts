@@ -8,6 +8,7 @@ import "server-only";
  * build small enough for serverless. On your own computer: your installed Chrome.
  */
 import fs from "node:fs";
+import path from "node:path";
 import puppeteer, { type Browser } from "puppeteer-core";
 
 const LOCAL_CHROME = [
@@ -21,18 +22,52 @@ const LOCAL_CHROME = [
   "/usr/bin/chromium-browser",
 ];
 
+// Hides the "controlled by automation" flag that some sites use to hide content from bots
+const COMMON_ARGS = ["--disable-blink-features=AutomationControlled", "--hide-scrollbars", "--mute-audio"];
+
+// The serverless package enables these by default. A public tool that opens
+// random websites should keep normal browser security on.
+const UNSAFE_ARGS = new Set(["--disable-web-security", "--allow-running-insecure-content"]);
+
 let browserPromise: Promise<Browser> | null = null;
 
 /**
  * Serverless Chromium runs with --single-process to save memory. In that mode it
  * cannot open separate browser contexts, so capture.ts uses a normal tab and
- * clears cookies afterwards instead.
+ * clears cookies and cache instead.
  */
 export let singleProcess = false;
 
-// The serverless package enables these by default. A public tool that opens
-// random websites should keep normal browser security on.
-const UNSAFE_ARGS = new Set(["--disable-web-security", "--allow-running-insecure-content"]);
+/**
+ * Serverless Chromium ships with only one font (Open Sans). Any text that relies
+ * on fonts installed on the visitor's computer (Arial, Helvetica, Times, emoji,
+ * Hindi...) would come out wrong or as empty boxes. This points Chromium at the
+ * fonts in /fonts and maps common font names to look-alikes with the same widths,
+ * so line breaks match what real visitors see.
+ */
+function setupServerlessFonts() {
+  const dir = [path.join(process.cwd(), "fonts"), "/var/task/fonts"].find((d) => fs.existsSync(d));
+  const confDir = "/tmp/pf-fontconfig";
+  fs.mkdirSync(confDir, { recursive: true });
+  const alias = (names: string[], to: string) =>
+    names.map((n) => `<alias binding="same"><family>${n}</family><prefer><family>${to}</family></prefer></alias>`).join("\n");
+  const fallbacks = "<family>DejaVu Sans</family><family>Noto Sans Devanagari</family><family>Noto Color Emoji</family>";
+  fs.writeFileSync(path.join(confDir, "fonts.conf"), `<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>/tmp/fonts</dir>
+  ${dir ? `<dir>${dir}</dir>` : ""}
+  <cachedir>/tmp/fonts-cache/</cachedir>
+  ${alias(["Arial", "Helvetica", "Helvetica Neue", "Arimo", "Segoe UI", "system-ui", "-apple-system", "BlinkMacSystemFont", "Tahoma", "Verdana", "Trebuchet MS"], "Liberation Sans")}
+  ${alias(["Times New Roman", "Times", "Georgia", "Cambria", "Tinos"], "Liberation Serif")}
+  ${alias(["Courier New", "Courier", "Consolas", "Menlo", "Monaco", "Cousine"], "Liberation Mono")}
+  <alias><family>sans-serif</family><prefer><family>Liberation Sans</family>${fallbacks}</prefer></alias>
+  <alias><family>serif</family><prefer><family>Liberation Serif</family>${fallbacks}</prefer></alias>
+  <alias><family>monospace</family><prefer><family>Liberation Mono</family>${fallbacks}</prefer></alias>
+  <alias><family>emoji</family><prefer><family>Noto Color Emoji</family></prefer></alias>
+</fontconfig>`);
+  process.env.FONTCONFIG_PATH = confDir;
+}
 
 async function launch(): Promise<Browser> {
   const serverless = Boolean(
@@ -46,13 +81,14 @@ async function launch(): Promise<Browser> {
       executablePath: local,
       headless: true,
       defaultViewport: null,
-      args: ["--disable-dev-shm-usage", "--no-first-run", "--hide-scrollbars", "--mute-audio"],
+      args: ["--disable-dev-shm-usage", "--no-first-run", ...COMMON_ARGS],
     });
   }
 
+  setupServerlessFonts(); // must run before Chromium starts
   const chromium = (await import("@sparticuz/chromium")).default;
   chromium.setGraphicsMode = false;
-  const args = chromium.args.filter((a) => !UNSAFE_ARGS.has(a));
+  const args = [...chromium.args.filter((a) => !UNSAFE_ARGS.has(a)), ...COMMON_ARGS];
   singleProcess = args.includes("--single-process");
   return puppeteer.launch({
     executablePath: await chromium.executablePath(),

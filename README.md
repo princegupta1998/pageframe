@@ -38,6 +38,30 @@ Browser (your visitor)                      Vercel
 Each screenshot is one short request (about 4 to 10 seconds), so it fits comfortably inside
 Vercel's function limits. The server keeps nothing: no database, no files, no accounts.
 
+## How screenshots stay accurate
+
+Real visitors see a page after it has fully woken up. A headless browser doesn't, unless it acts like one:
+
+- **Delayed JavaScript:** WP Rocket, LiteSpeed, Perfmatters and FlyingPress wait for a mouse move,
+  touch or key press before running the site's JavaScript. The tool moves the mouse, scrolls the
+  wheel and taps a key first, then waits, so carousels, sliders and Elementor widgets start.
+- **Lazy loading:** `data-src` / `data-lazy-src` images, lazy iframes and Elementor lazy backgrounds
+  are switched on, then the page is scrolled slowly and every image and background is waited for.
+- **Animations:** finished instantly; Elementor, AOS and WOW.js entrance animations are shown.
+- **content-visibility:auto** is turned off, so off-screen sections aren't left blank.
+- **Fonts:** Vercel's Chromium has only one font. `/fonts` adds Arial/Times/Courier look-alikes with
+  the same widths, emoji and Hindi, so text wraps the way real visitors see it.
+
+## Skipping caches
+
+With "Skip all caches" on (default), the site's own HTML, CSS and JS are requested with a unique
+`?pf_nocache=` value, and the page itself also gets `Cache-Control: no-cache`. Cloudflare,
+RunCloud/Nginx, LiteSpeed and WP Rocket store pages by full URL, so none of them has a copy and
+WordPress builds the page fresh. The browser cache and cookies are also cleared before every screenshot.
+
+Limits: a cache set to ignore query strings (for example Cloudflare's "Ignore query string" cache
+level) still answers from its copy, and so does a site that redirects unknown parameters away.
+
 ## Settings (optional environment variables)
 
 | Variable | Default | What it does |
@@ -77,3 +101,4 @@ For a stricter limit per visitor, add a rate-limit rule in Vercel under **Firewa
     src/lib/browser.ts               starts Chromium (serverless or local)
     src/lib/guard.ts                 blocks private network addresses
     src/lib/devices.ts               device profiles
+    fonts/                           extra fonts for Vercel's Chromium
