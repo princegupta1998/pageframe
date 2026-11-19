@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+:root {
+  --canvas: #ECEFF3;
+  --surface: #FFFFFF;
+  --sunken: #F4F6F9;
+  --ink: #172033;
+  --muted: #5A6577;
+  --line: #D3D9E1;
+  --accent: #2546D6;
+  --on-accent: #FFFFFF;
+  --accent-soft: #E3E8FC;
+  --ok: #16804D;
+  --bad: #B8381F;
+  --bad-soft: #FBEAE6;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #0F131A;
+    --surface: #171D27;
+    --sunken: #121720;
+    --ink: #E4E9F1;
+    --muted: #93A0B4;
+    --line: #283142;
+    --accent: #7B93FF;
+    --on-accent: #0F131A;
+    --accent-soft: #1F2A4D;
+    --ok: #4CC38A;
+    --bad: #FF8A70;
+    --bad-soft: #3A1E19;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --font-sans: var(--font-instrument), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@keyframes pf-pulse { 50% { opacity: .45; } }
+.pf-pulse { animation: pf-pulse 1.4s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .pf-pulse { animation: none; }
+}
