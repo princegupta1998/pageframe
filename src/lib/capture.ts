@@ -110,9 +110,15 @@ async function revealLazyContent(page: Page) {
   }).catch(() => {});
 }
 
-/** Waits for images, CSS background images and web fonts, at most 10 seconds. */
+/**
+ * Waits for images, CSS background images and web fonts. On Vercel the CPU is
+ * slower than on a desktop computer, so pages with 100+ lazy images need more
+ * time: up to 15 seconds, then one more check for anything still loading.
+ * "complete" isn't enough either: an image can be downloaded but not yet decoded
+ * (turned into pixels), which still shows as a blank box, so we wait for decode too.
+ */
 async function waitForVisuals(page: Page) {
-  await page.evaluate(async () => {
+  const pass = (timeoutMs: number) => page.evaluate(async (timeoutMs) => {
     const bgUrls = new Set<string>();
     const all = document.querySelectorAll<HTMLElement>("body *");
     for (let i = 0; i < all.length && bgUrls.size < 300; i++) {
@@ -120,21 +126,27 @@ async function waitForVisuals(page: Page) {
       if (!bg || bg === "none") continue;
       for (const m of bg.matchAll(/url\(["']?(.*?)["']?\)/g)) if (!m[1].startsWith("data:")) bgUrls.add(m[1]);
     }
-    const pending = Array.from(document.images).filter((i) => !i.complete);
+    const imgs = Array.from(document.images).filter((i) => i.getAttribute("src") || i.currentSrc);
+    const ready = (img: HTMLImageElement) => new Promise<void>((r) => {
+      const done = () => { img.decode().catch(() => {}).finally(() => r()); };
+      if (img.complete) return done();
+      img.addEventListener("load", done, { once: true });
+      img.addEventListener("error", () => r(), { once: true });
+    });
     await Promise.race([
       Promise.all([
         document.fonts?.ready,
-        ...pending.map((i) => new Promise((r) => {
-          i.addEventListener("load", r, { once: true });
-          i.addEventListener("error", r, { once: true });
-        })),
-        // Loading the same URL again is served from the browser's memory, so this
-        // finishes when the background image itself has arrived.
+        ...imgs.map(ready),
+        // Same URL again is served from memory, so this finishes when the background has arrived
         ...Array.from(bgUrls).map((u) => new Promise((r) => { const im = new Image(); im.onload = im.onerror = r; im.src = u; })),
       ]),
-      new Promise((r) => setTimeout(r, 10_000)),
+      new Promise((r) => setTimeout(r, timeoutMs)),
     ]);
-  }).catch(() => {});
+    return Array.from(document.images).filter((i) => !i.complete).length;
+  }, timeoutMs).catch(() => 0);
+
+  const stillLoading = await pass(15_000);
+  if (stillLoading > 0) await pass(5_000);
 }
 
 export interface ShotResult {
@@ -142,6 +154,8 @@ export interface ShotResult {
   width: number;
   height: number;
   truncated: boolean;
+  /** Image addresses that failed to load on the live site (404s and similar) */
+  broken: string[];
 }
 
 export async function captureShot(
@@ -230,6 +244,24 @@ export async function captureShot(
     await page.evaluate(() => scrollTo(0, 0)).catch(() => {});
     await sleep(500 + opts.delay);
 
+    // Set PF_DEBUG=1 (locally or in Vercel's environment variables) to log images
+    // that still aren't ready at the moment of capture
+    if (process.env.PF_DEBUG) {
+      const report = await page.evaluate(() => {
+        const imgs = Array.from(document.images);
+        const bad = imgs.filter((i) => !i.complete || i.naturalWidth === 0 || (i.getAttribute("src") || "").startsWith("data:"));
+        return { total: imgs.length, notReady: bad.length,
+          examples: bad.slice(0, 6).map((i) => `${i.complete ? "done" : "loading"} ${i.naturalWidth}w ${(i.currentSrc || i.getAttribute("data-src") || "").slice(-70)}`) };
+      }).catch(() => null);
+      console.log("[pf-debug]", device.id, url, JSON.stringify(report));
+    }
+
+    // Images the site itself failed to deliver (missing files, 404s). Worth fixing on
+    // the site, and it tells you a blank box in the screenshot isn't the tool's fault.
+    const broken = await page.evaluate(() => [...new Set(Array.from(document.images)
+      .filter((i) => i.complete && i.naturalWidth === 0 && i.currentSrc && !i.currentSrc.startsWith("data:"))
+      .map((i) => i.currentSrc))].slice(0, 10)).catch(() => [] as string[]);
+
     // 6. Capture
     const pageHeight = await page.evaluate(() =>
       Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0));
@@ -240,16 +272,18 @@ export async function captureShot(
 
     // Very long pages can exceed the 4.5 MB response limit: lower JPEG quality until it fits
     let quality = opts.quality;
-    let buffer = await page.screenshot({ type: "jpeg", quality, clip, captureBeyondViewport: true });
+    // optimizeForSpeed: faster, lighter image encoding, which matters on tall desktop pages
+    const shoot = () => page.screenshot({ type: "jpeg", quality, clip, captureBeyondViewport: true, optimizeForSpeed: true });
+    let buffer = await shoot();
     while (buffer.byteLength > MAX_BYTES && quality > 40) {
       quality = Math.max(40, quality - 15);
-      buffer = await page.screenshot({ type: "jpeg", quality, clip, captureBeyondViewport: true });
+      buffer = await shoot();
     }
     if (buffer.byteLength > MAX_BYTES) {
       throw new Error("This page is too long for one image. Turn off Retina or full page and try again.");
     }
 
-    return { buffer, width: device.width, height, truncated: opts.fullPage && pageHeight > maxHeight };
+    return { buffer, width: device.width, height, truncated: opts.fullPage && pageHeight > maxHeight, broken };
   } finally {
     if (context) {
       await context.close().catch(() => {});
@@ -257,6 +291,12 @@ export async function captureShot(
       await page.close().catch(() => {});
     }
   }
+}
+
+/** Chromium died or lost its connection, usually from running out of memory. */
+export function isBrowserCrash(err: unknown) {
+  return /Target closed|Session closed|has been closed|disconnected|detached|crash|Connection closed|Protocol error/i
+    .test(String((err as Error)?.message ?? err));
 }
 
 export function friendlyError(err: unknown): string {
@@ -267,5 +307,7 @@ export function friendlyError(err: unknown): string {
   if (/ERR_CERT|SSL/.test(m)) return "The website has an SSL certificate problem.";
   if (/timeout|timed out/i.test(m)) return "The page took too long to load.";
   if (/too long for one image/.test(m)) return m;
-  return "Could not capture this page.";
+  if (isBrowserCrash(err)) return "The browser ran out of memory on this page. Try again, or turn off full page.";
+  // Show the real reason, so problems can be traced instead of guessed
+  return `Could not capture this page (${m.slice(0, 90)}).`;
 }

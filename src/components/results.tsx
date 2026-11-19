@@ -19,6 +19,7 @@ export interface Shot {
   width?: number;
   height?: number;
   truncated?: boolean;
+  broken?: string[];
 }
 export interface Run {
   startedAt: number;
@@ -80,7 +81,8 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
         files[`${folder}/${s.site}/${s.device.replace(":", "-")}/${fileName(s)}`] = new Uint8Array(await s.blob.arrayBuffer());
       }
       const csv = [["site", "page", "device", "url", "status", "note"],
-        ...run.shots.map((s) => [s.site, s.label, s.device, s.url, s.status === "done" ? "ok" : s.status, s.error ?? (s.truncated ? "cut at maximum height" : "")])]
+        ...run.shots.map((s) => [s.site, s.label, s.device, s.url, s.status === "done" ? "ok" : s.status,
+          s.error ?? [s.truncated ? "cut at maximum height" : "", s.broken?.length ? `broken images on the site: ${s.broken.join(" | ")}` : ""].filter(Boolean).join("; ")])]
         .map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
       files[`${folder}/report.csv`] = new TextEncoder().encode(csv);
       // level 0: JPEGs are already compressed, so zipping is instant
@@ -151,7 +153,16 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
                   if (!s || !d) return null;
                   // Tiles keep the devices' real proportions to each other
                   const style = { width: Math.max(110, Math.round(d.width * 0.26)), aspectRatio: `${d.width} / ${d.height}` };
-                  const caption = <span className="mt-1.5 block text-[0.8rem] text-muted">{d.name}</span>;
+                  const caption = (
+                    <span className="mt-1.5 block text-[0.8rem] text-muted">
+                      {d.name}
+                      {!!s.broken?.length && (
+                        <span className="block font-semibold text-bad" title={s.broken.join("\n")}>
+                          ⚠ {s.broken.length} broken image{s.broken.length > 1 ? "s" : ""} on site
+                        </span>
+                      )}
+                    </span>
+                  );
                   if (s.status === "done") {
                     return (
                       <button key={id} onClick={() => setOpen(s.id)} className="group shrink-0 text-left" aria-label={`Open ${d.name} screenshot`}>
@@ -220,6 +231,14 @@ function Lightbox({ shots, startId, onClose }: { shots: Shot[]; startId: string;
         <img src={s.src} alt={`${s.label} on ${devName(s.device)}`} style={{ width: Math.min(s.width ?? 1400, 1400) }}
           className="mx-auto block h-auto max-w-full rounded shadow-[0_10px_40px_rgba(0,0,0,.4)]" />
         {s.truncated && <p className="mt-3 text-center text-sm text-[#93A0B4]">This page is very long, so the image stops at the maximum height.</p>}
+        {!!s.broken?.length && (
+          <div className="mx-auto mt-4 max-w-3xl rounded-lg border border-[#5A2A22] bg-[#2A1714] p-4 text-sm text-[#FFB4A3]">
+            <b className="block">These images are broken on the live site (they fail for real visitors too):</b>
+            <ul className="mt-2 list-disc pl-5 font-mono text-[0.78rem] break-all">
+              {s.broken.map((u) => <li key={u}><a href={u} target="_blank" rel="noopener noreferrer" className="underline">{u}</a></li>)}
+            </ul>
+          </div>
+        )}
       </div>
     </div>
   );

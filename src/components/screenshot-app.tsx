@@ -41,6 +41,10 @@ async function requestShot(s: Shot, options: CaptureOptions): Promise<Partial<Sh
           width: Number(res.headers.get("x-width")) || undefined,
           height: Number(res.headers.get("x-height")) || undefined,
           truncated: res.headers.get("x-truncated") === "1",
+          broken: (() => {
+            try { return JSON.parse(decodeURIComponent(res.headers.get("x-broken-images") || "%5B%5D")) as string[]; }
+            catch { return []; }
+          })(),
         };
       }
       const data = await res.json().catch(() => null);

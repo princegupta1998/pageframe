@@ -49,6 +49,8 @@ Real visitors see a page after it has fully woken up. A headless browser doesn't
   are switched on, then the page is scrolled slowly and every image and background is waited for.
 - **Animations:** finished instantly; Elementor, AOS and WOW.js entrance animations are shown.
 - **content-visibility:auto** is turned off, so off-screen sections aren't left blank.
+- **Broken images:** images the site itself fails to deliver (404s) are listed on the tile, in the
+  viewer and in `report.csv`, so a blank box can be traced to the site instead of the tool.
 - **Fonts:** Vercel's Chromium has only one font. `/fonts` adds Arial/Times/Courier look-alikes with
   the same widths, emoji and Hindi, so text wraps the way real visitors see it.
 
@@ -72,6 +74,8 @@ level) still answers from its copy, and so does a site that redirects unknown pa
 | `SHOTS_PER_IP_PER_10_MIN` | 120 | Speed bump per visitor (per server instance) |
 | `MAX_PAGE_HEIGHT` | 16000 | Longest page height captured, in pixels |
 | `CHROME_PATH` | auto | Local Chrome path, for `npm run dev` only |
+| `SHOTS_PER_INSTANCE` | 1 on Vercel, 2 locally | Screenshots running at once in one server instance |
+| `PF_DEBUG` | off | Set to `1` to log images that aren't ready at capture time (Vercel → Logs) |
 
 Set them in Vercel under **Settings → Environment Variables**, then redeploy.
 

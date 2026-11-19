@@ -2,8 +2,8 @@ import { getDevice } from "@/lib/devices";
 import { sanitizeOptions } from "@/lib/options";
 import { normalizeUrl } from "@/lib/url";
 import { assertSafeUrl } from "@/lib/guard";
-import { getBrowser, withSlot } from "@/lib/browser";
-import { captureShot, friendlyError } from "@/lib/capture";
+import { getBrowser, resetBrowser, withSlot } from "@/lib/browser";
+import { captureShot, friendlyError, isBrowserCrash } from "@/lib/capture";
 import { allow, clientIp } from "@/lib/rate-limit";
 
 // One screenshot per request, so each call stays well inside Vercel's time limit.
@@ -28,8 +28,18 @@ export async function POST(req: Request) {
   try { await assertSafeUrl(url); }
   catch (e) { return fail(400, `${new URL(url).hostname}: ${(e as Error).message}.`); }
 
+  const take = () => withSlot(async () => captureShot(await getBrowser(), { url, device, opts }));
   try {
-    const shot = await withSlot(async () => captureShot(await getBrowser(), { url, device, opts }));
+    let shot;
+    try {
+      shot = await take();
+    } catch (e) {
+      // If Chromium crashed (usually out of memory), start a fresh one and try once more
+      if (!isBrowserCrash(e)) throw e;
+      console.warn("browser crashed, retrying with a fresh one", url, device.id, e);
+      await resetBrowser();
+      shot = await take();
+    }
     return new Response(shot.buffer as Uint8Array<ArrayBuffer>, {
       headers: {
         "Content-Type": "image/jpeg",
@@ -37,6 +47,7 @@ export async function POST(req: Request) {
         "X-Width": String(shot.width),
         "X-Height": String(shot.height),
         "X-Truncated": shot.truncated ? "1" : "0",
+        "X-Broken-Images": encodeURIComponent(JSON.stringify(shot.broken)),
       },
     });
   } catch (e) {

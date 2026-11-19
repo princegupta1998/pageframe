@@ -98,6 +98,14 @@ async function launch(): Promise<Browser> {
   });
 }
 
+/** Throws away a crashed or stuck browser so the next request starts a fresh one. */
+export async function resetBrowser() {
+  const old = browserPromise;
+  browserPromise = null;
+  const b = await old?.catch(() => null);
+  await b?.close().catch(() => {});
+}
+
 export async function getBrowser(): Promise<Browser> {
   if (browserPromise) {
     const b = await browserPromise.catch(() => null);
@@ -111,11 +119,17 @@ export async function getBrowser(): Promise<Browser> {
   return browserPromise;
 }
 
-// Vercel can send several requests to one warm instance at once. Chrome pages
-// use a lot of memory, so at most 2 screenshots run per instance; the rest wait.
+// Vercel can send several requests to one warm instance at once. A tall desktop
+// screenshot holds ~50 megapixels in memory, and in single-process mode one
+// out-of-memory crash takes down every page in that browser. So serverless runs
+// one screenshot at a time per instance (Vercel starts more instances when busy);
+// your own computer can run two.
+const SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.USE_SERVERLESS_CHROMIUM);
+const MAX_PARALLEL = Number(process.env.SHOTS_PER_INSTANCE) || (SERVERLESS ? 1 : 2);
+
 let active = 0;
 const waiting: (() => void)[] = [];
-export async function withSlot<T>(fn: () => Promise<T>, max = 2): Promise<T> {
+export async function withSlot<T>(fn: () => Promise<T>, max = MAX_PARALLEL): Promise<T> {
   if (active >= max) await new Promise<void>((r) => waiting.push(r));
   active++;
   try {
