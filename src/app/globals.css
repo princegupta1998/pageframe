@@ -64,3 +64,24 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .pf-pulse { animation: none; }
 }
+
+/* Hover-to-scroll preview on result tiles.
+   Resting: back to the top quickly. Hovered (or focused with the keyboard):
+   glide down at a steady speed set per tile in --pf-dur, by --pf-shift pixels. */
+.pf-scroll-img {
+  transform: translateY(0);
+  transition: transform 0.6s ease-out;
+  will-change: transform;
+}
+.pf-tile:hover .pf-scroll-img,
+.pf-tile:focus-visible .pf-scroll-img {
+  transform: translateY(var(--pf-shift, 0));
+  transition: transform var(--pf-dur, 6s) linear;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pf-tile:hover .pf-scroll-img,
+  .pf-tile:focus-visible .pf-scroll-img {
+    transform: none;
+    transition: none;
+  }
+}

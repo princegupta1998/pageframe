@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { zipSync } from "fflate";
 import { getDevice } from "@/lib/devices";
 
@@ -181,11 +181,26 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
                     </span>
                   );
                   if (s.status === "done") {
+                    // Hover-to-scroll: the tile is a small window onto a tall screenshot.
+                    // How far the image must move up = its height in the tile minus the window height.
+                    const frameW = style.width;
+                    const frameH = frameW * (d.height / d.width);
+                    const imageH = s.width && s.height ? frameW * (s.height / s.width) : frameH;
+                    const shift = Math.max(0, imageH - frameH);
+                    // Same reading speed for every page (about 150px per second at tile size),
+                    // so long pages take longer instead of rushing past
+                    const seconds = Math.min(20, Math.max(1.2, shift / 150));
+                    const scrollVars = { "--pf-shift": `-${shift.toFixed(1)}px`, "--pf-dur": `${seconds.toFixed(1)}s` } as CSSProperties;
                     return (
-                      <button key={id} onClick={() => setOpen(s.id)} className="group shrink-0 text-left" aria-label={`Open ${d.name} screenshot`}>
-                        <span style={style} className="block overflow-hidden rounded-md border border-line bg-sunken group-hover:border-accent group-hover:shadow-[0_0_0_1px_var(--accent)]">
+                      <button key={id} onClick={() => setOpen(s.id)} className="pf-tile group shrink-0 text-left" aria-label={`Open ${d.name} screenshot`}>
+                        <span style={style} className="relative block overflow-hidden rounded-md border border-line bg-sunken group-hover:border-accent group-hover:shadow-[0_0_0_1px_var(--accent)] group-focus-visible:border-accent">
                           {/* eslint-disable-next-line @next/next/no-img-element */}
-                          <img src={s.src} alt="" className="size-full object-cover object-top" />
+                          <img src={s.src} alt="" style={scrollVars} className="pf-scroll-img block h-auto w-full" />
+                          {shift > 0 && (
+                            <span aria-hidden="true" className="pointer-events-none absolute bottom-1.5 right-1.5 rounded bg-ink/75 px-1.5 py-0.5 text-[0.68rem] font-medium text-surface opacity-100 transition-opacity group-hover:opacity-0">
+                              ↕ Hover to scroll
+                            </span>
+                          )}
                         </span>
                         {caption}
                       </button>
