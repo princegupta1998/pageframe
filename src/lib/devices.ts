@@ -24,8 +24,8 @@ export const DEVICES: Device[] = [
   { id: "desktop-xl", name: "Large desktop", width: 1920, height: 1080, mobile: false, ua: UA.desktop },
   { id: "desktop", name: "Desktop", width: 1440, height: 900, mobile: false, ua: UA.desktop },
   { id: "laptop", name: "Laptop", width: 1280, height: 800, mobile: false, ua: UA.desktop },
-  { id: "tablet-landscape", name: "iPad landscape", width: 1080, height: 810, mobile: true, ua: UA.ipad },
-  { id: "tablet", name: "iPad", width: 810, height: 1080, mobile: true, ua: UA.ipad },
+  // 1024px is Elementor's default tablet breakpoint, so this shows the tablet layout at its widest
+  { id: "tablet", name: "Tablet", width: 1024, height: 1366, mobile: true, ua: UA.ipad },
   { id: "android", name: "Pixel 7", width: 412, height: 839, mobile: true, ua: UA.android },
   { id: "phone", name: "iPhone 14", width: 390, height: 664, mobile: true, ua: UA.iphone },
 ];

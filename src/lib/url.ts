@@ -15,8 +15,16 @@ export function normalizeUrl(raw: unknown): string | null {
 
 export const hostOf = (u: string) => new URL(u).hostname.replace(/^www\./, "");
 
+/** Same page written differently (www., capitals, trailing slash) gives the same key. */
+export function pageKey(u: string): string {
+  const x = new URL(u);
+  return hostOf(u) + (x.pathname.replace(/\/+$/, "") || "/") + x.search;
+}
+
+/** A short, readable name for a page: the last part of its address ("/blog/my-post/" -> "my-post"). */
 export function slugFromUrl(u: string): string {
   const p = new URL(u).pathname.replace(/^\/+|\/+$/g, "");
   if (!p) return "home";
-  return p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "page";
+  const last = p.split("/").pop() || p;
+  return last.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "page";
 }

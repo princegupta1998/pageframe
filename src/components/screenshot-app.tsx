@@ -3,13 +3,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DEVICES, DEFAULT_DEVICES, getDevice } from "@/lib/devices";
 import { DEFAULT_OPTIONS, type CaptureOptions } from "@/lib/options";
-import { normalizeUrl, hostOf, slugFromUrl } from "@/lib/url";
+import { normalizeUrl, hostOf, slugFromUrl, pageKey } from "@/lib/url";
 import Results, { type Run, type Shot } from "./results";
 
 const MAX_SITES = Number(process.env.NEXT_PUBLIC_MAX_SITES) || 20;
 const MAX_SHOTS = Number(process.env.NEXT_PUBLIC_MAX_SHOTS) || 150;
 const PARALLEL = 3; // screenshots requested at the same time
-const WP_PAGE_COUNT = 7;
+const WP_PAGE_COUNT = 8;
 
 type Mode = "urls" | "wordpress";
 
@@ -41,6 +41,8 @@ async function requestShot(s: Shot, options: CaptureOptions): Promise<Partial<Sh
           width: Number(res.headers.get("x-width")) || undefined,
           height: Number(res.headers.get("x-height")) || undefined,
           truncated: res.headers.get("x-truncated") === "1",
+          reduced: res.headers.get("x-reduced") === "1",
+          httpStatus: Number(res.headers.get("x-status")) || undefined,
           broken: (() => {
             try { return JSON.parse(decodeURIComponent(res.headers.get("x-broken-images") || "%5B%5D")) as string[]; }
             catch { return []; }
@@ -81,7 +83,8 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
   const [mode, setMode] = useState<Mode>("urls");
   const [devices, setDevices] = useState<string[]>(DEFAULT_DEVICES);
   const [customOn, setCustomOn] = useState(false);
-  const [customWidth, setCustomWidth] = useState(1366);
+  // Kept as text so the field can be cleared and retyped; checked when starting
+  const [customWidth, setCustomWidth] = useState("1366");
   const [options, setOptions] = useState<CaptureOptions>(DEFAULT_OPTIONS);
   const [error, setError] = useState("");
   const [run, setRun] = useState<Run | null>(null);
@@ -97,7 +100,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
       if (p.mode) setMode(p.mode);
       if (Array.isArray(p.devices)) setDevices(p.devices.filter((d: string) => getDevice(d)));
       if (typeof p.customOn === "boolean") setCustomOn(p.customOn);
-      if (p.customWidth) setCustomWidth(p.customWidth);
+      if (p.customWidth) setCustomWidth(String(p.customWidth));
       if (p.options) setOptions({ ...DEFAULT_OPTIONS, ...p.options });
     } catch {}
     loaded.current = true;
@@ -115,15 +118,25 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
     return () => window.removeEventListener("beforeunload", warn);
   }, [running]);
 
-  const urls = useMemo(
-    () => [...new Set(urlsText.split(/[\s,]+/).map(normalizeUrl).filter((u): u is string => !!u))],
-    [urlsText],
-  );
+  // The same page (or, in WordPress mode, the same site) written several ways counts once
+  const urls = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const u of urlsText.split(/[\s,]+/).map(normalizeUrl)) {
+      if (!u) continue;
+      const key = mode === "wordpress" ? hostOf(u) : pageKey(u);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(mode === "wordpress" ? new URL(u).origin + "/" : u);
+    }
+    return out;
+  }, [urlsText, mode]);
+  const customValid = /^\d{3,4}$/.test(customWidth) && !!getDevice(`custom:${customWidth}`);
   const chosen = useMemo(() => {
     const list = DEVICES.map((d) => d.id).filter((id) => devices.includes(id));
-    if (customOn && getDevice(`custom:${customWidth}`)) list.push(`custom:${customWidth}`);
+    if (customOn && customValid) list.push(`custom:${customWidth}`);
     return list;
-  }, [devices, customOn, customWidth]);
+  }, [devices, customOn, customWidth, customValid]);
   const estimate = urls.length * (mode === "wordpress" ? WP_PAGE_COUNT : 1) * chosen.length;
 
   const setOpt = <K extends keyof CaptureOptions>(key: K, value: CaptureOptions[K]) =>
@@ -139,6 +152,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
     if (!urlsText.trim()) return setError("Add at least one website address.");
     if (!urls.length) return setError("That doesn't look like a website address. Use a domain like example.com or a full https:// link.");
     if (urls.length > MAX_SITES) return setError(`Add up to ${MAX_SITES} websites at a time.`);
+    if (customOn && !customValid) return setError("Custom width must be a number from 320 to 3840.");
     if (!chosen.length) return setError("Pick at least one device.");
     if (estimate > MAX_SHOTS) return setError(`That's ${estimate} screenshots. The limit is ${MAX_SHOTS} per run, so pick fewer websites or devices.`);
 
@@ -146,7 +160,8 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
     stopRef.current = false;
     const opts = { ...options };
     const startedAt = Date.now();
-    setRun({ startedAt, mode, devices: chosen, phase: mode === "wordpress" ? "discovering" : "capturing", shots: [] });
+    const notes: Record<string, string> = {};
+    setRun({ startedAt, mode, devices: chosen, phase: mode === "wordpress" ? "discovering" : "capturing", shots: [], notes });
     setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 50);
 
     // 1) Work out which pages to capture
@@ -155,8 +170,9 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
       for (const device of chosen) {
         shots.push({
           id: uid(), site, label, ord, url: url ?? "", device,
-          status: url ? "queued" : "failed",
-          error: url ? undefined : note ?? "This page could not be found on the site.",
+          // A page the site doesn't have isn't a failed screenshot
+          status: url ? "queued" : note ? "failed" : "missing",
+          error: url ? undefined : note ?? "Not on this site",
         });
       }
     };
@@ -169,13 +185,14 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
           });
           const data = await res.json();
           if (!res.ok) throw new Error(data?.error || "Could not read this site.");
-          return data as { site: string; pages: { label: string; ord: number; url: string | null }[] };
+          return data as { site: string; wordpress: boolean; pages: { label: string; ord: number; url: string | null }[] };
         } catch (e) {
           return { site: hostOf(u), pages: [{ label: "home", ord: 0, url: null }], error: (e as Error).message };
         }
       });
       for (const f of found) {
         const err = "error" in f ? (f.error as string) : undefined;
+        if (!err && "wordpress" in f && !f.wordpress) notes[f.site] = "This doesn't look like a WordPress site, so only the home page was captured.";
         for (const p of f.pages) addPage(f.site, p.label, p.ord, p.url, err);
       }
     } else {
@@ -192,7 +209,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
         addPage(site, label, ord, u);
       }
     }
-    setRun((r) => r && { ...r, phase: "capturing", shots: [...shots] });
+    setRun((r) => r && { ...r, phase: "capturing", shots: [...shots], notes: { ...notes } });
 
     // 2) Capture: each screenshot is its own short request to the server
     const queue = shots.filter((s) => s.status === "queued");
@@ -258,7 +275,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
             <div className="grid gap-2.5 sm:grid-cols-2">
               {([
                 ["urls", "Exact pages", "Only the addresses you listed."],
-                ["wordpress", "WordPress key pages", "Home, about, contact, a category, the latest post, its author and the privacy policy."],
+                ["wordpress", "WordPress key pages", "Home, about, contact, blog page, a category, the latest post, its author and the privacy policy."],
               ] as const).map(([value, title, text]) => (
                 <label key={value} className="cursor-pointer">
                   <input type="radio" name="mode" value={value} checked={mode === value}
@@ -279,19 +296,20 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
                 <label key={d.id} title={`${d.width} × ${d.height}`}
                   className="group relative grid cursor-pointer content-end justify-items-center gap-0.5 rounded-lg border border-line bg-sunken px-2 pb-2.5 pt-3 text-center has-[:checked]:border-accent has-[:checked]:bg-accent-soft has-[:checked]:shadow-[inset_0_0_0_1px_var(--accent)] has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent">
                   <input type="checkbox" className="sr-only" checked={devices.includes(d.id)} onChange={() => toggleDevice(d.id)} />
-                  <span className="mb-1.5 flex h-[72px] items-end"><Glyph width={d.width} height={d.height} mobile={d.mobile} /></span>
+                  <span className="mb-1.5 flex h-[84px] items-end"><Glyph width={d.width} height={d.height} mobile={d.mobile} /></span>
                   <span className="text-[0.86rem] font-semibold">{d.name}</span>
                   <span className="text-[0.78rem] tabular-nums text-muted">{d.width} × {d.height}</span>
                 </label>
               ))}
               <label className="group relative grid cursor-pointer content-end justify-items-center gap-0.5 rounded-lg border border-line bg-sunken px-2 pb-2.5 pt-3 text-center has-[:checked]:border-accent has-[:checked]:bg-accent-soft has-[:checked]:shadow-[inset_0_0_0_1px_var(--accent)]">
                 <input type="checkbox" className="sr-only" checked={customOn} onChange={(e) => setCustomOn(e.target.checked)} />
-                <span className="mb-1.5 flex h-[72px] items-end"><Glyph width={1366} height={900} dashed /></span>
+                <span className="mb-1.5 flex h-[84px] items-end"><Glyph width={1366} height={900} dashed /></span>
                 <span className="text-[0.86rem] font-semibold">Custom width</span>
                 <span className="flex items-center gap-1 text-[0.78rem] text-muted">
-                  <input type="number" min={320} max={3840} value={customWidth} aria-label="Custom width in pixels"
-                    onChange={(e) => setCustomWidth(Number(e.target.value) || 1366)}
-                    className="w-16 rounded border border-line bg-surface px-1 py-0.5 text-ink" /> px
+                  <input type="text" inputMode="numeric" value={customWidth} aria-label="Custom width in pixels"
+                    aria-invalid={customOn && !customValid}
+                    onChange={(e) => { setCustomWidth(e.target.value.replace(/\D/g, "").slice(0, 4)); setCustomOn(true); }}
+                    className={`w-16 rounded border bg-surface px-1 py-0.5 text-ink ${customOn && !customValid ? "border-bad" : "border-line"}`} /> px
                 </span>
               </label>
             </div>
@@ -325,7 +343,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
               </label>
               <label className="grid gap-1 text-[0.9rem] font-medium">Extra wait before capture (seconds)
                 <input type="number" min={0} max={8} step={0.5} value={options.delay / 1000}
-                  onChange={(e) => setOpt("delay", Math.round((Number(e.target.value) || 0) * 1000))}
+                  onChange={(e) => setOpt("delay", Math.min(8000, Math.max(0, Math.round((Number(e.target.value) || 0) * 1000))))}
                   className="rounded-lg border border-line bg-sunken px-3 py-2 font-normal" />
               </label>
               <label className="grid gap-1 text-[0.9rem] font-medium sm:col-span-2">Hide these elements
@@ -352,7 +370,7 @@ export default function ScreenshotApp({ appName }: { appName: string }) {
         </form>
 
         <div ref={resultsRef} className="scroll-mt-6">
-          {run && <Results run={run} onStop={() => { stopRef.current = true; }} />}
+          {run && <Results key={run.startedAt} run={run} onStop={() => { stopRef.current = true; }} />}
         </div>
       </main>
 

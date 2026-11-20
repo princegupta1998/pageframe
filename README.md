@@ -45,10 +45,16 @@ Real visitors see a page after it has fully woken up. A headless browser doesn't
 - **Delayed JavaScript:** WP Rocket, LiteSpeed, Perfmatters and FlyingPress wait for a mouse move,
   touch or key press before running the site's JavaScript. The tool moves the mouse, scrolls the
   wheel and taps a key first, then waits, so carousels, sliders and Elementor widgets start.
+- **Screen by screen:** the page is scrolled one screen at a time and each screen is photographed,
+  then the photos are joined with sharp. Chrome only draws what's on screen, so memory stays flat on
+  long posts, and every image has been on screen (and therefore drawn) before it's photographed.
+  If a page still crashes, Chrome is restarted and retried; as a last resort the top 6,000px are saved.
 - **Lazy loading:** `data-src` / `data-lazy-src` images, lazy iframes and Elementor lazy backgrounds
   are switched on, then the page is scrolled slowly and every image and background is waited for.
 - **Animations:** finished instantly; Elementor, AOS and WOW.js entrance animations are shown.
 - **content-visibility:auto** is turned off, so off-screen sections aren't left blank.
+- **Page problems are flagged:** pages that answer 404/403/500, PDF or image links, and WordPress
+  pages a site doesn't have ("not on the site") are shown clearly instead of as blank captures.
 - **Broken images:** images the site itself fails to deliver (404s) are listed on the tile, in the
   viewer and in `report.csv`, so a blank box can be traced to the site instead of the tool.
 - **Fonts:** Vercel's Chromium has only one font. `/fonts` adds Arial/Times/Courier look-alikes with

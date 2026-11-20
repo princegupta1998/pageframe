@@ -17,9 +17,13 @@ export async function POST(req: Request) {
   try { await assertSafeUrl(url); }
   catch (e) { return fail(400, `${hostOf(url)}: ${(e as Error).message}.`); }
 
-  const found = await discoverWordPress(url).catch(() => ({ home: url }) as Record<string, string>);
+  const { found, wordpress } = await discoverWordPress(url)
+    .catch(() => ({ found: { home: new URL(url).origin + "/" } as Record<string, string>, wordpress: false }));
+  const pages = WP_PAGES.map(([key, label], ord) => ({ label, ord, url: (found as Record<string, string | undefined>)[key] ?? null }));
   return Response.json({
     site: hostOf(url),
-    pages: WP_PAGES.map(([key, label], ord) => ({ label, ord, url: (found as Record<string, string | undefined>)[key] ?? null })),
+    wordpress,
+    // Not WordPress: only the home page makes sense
+    pages: wordpress ? pages : pages.slice(0, 1),
   });
 }

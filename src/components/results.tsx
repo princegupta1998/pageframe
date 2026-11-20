@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { zipSync } from "fflate";
 import { getDevice } from "@/lib/devices";
 
-export type ShotStatus = "queued" | "running" | "done" | "failed";
+export type ShotStatus = "queued" | "running" | "done" | "failed" | "missing";
 export interface Shot {
   id: string;
   site: string;
@@ -19,7 +19,9 @@ export interface Shot {
   width?: number;
   height?: number;
   truncated?: boolean;
+  reduced?: boolean;
   broken?: string[];
+  httpStatus?: number;
 }
 export interface Run {
   startedAt: number;
@@ -27,10 +29,14 @@ export interface Run {
   devices: string[];
   phase: "discovering" | "capturing" | "done" | "stopped";
   shots: Shot[];
+  /** Per-site notes, e.g. "not a WordPress site" */
+  notes?: Record<string, string>;
 }
 
 const pretty = (s: string) => { const t = s.replace(/-/g, " "); return t.charAt(0).toUpperCase() + t.slice(1); };
 const devName = (id: string) => getDevice(id)?.name ?? id;
+// Status codes that usually mean the site blocks automated visitors rather than a missing page
+const blockedHint = (code?: number) => (code && [401, 403, 429, 503].includes(code) ? " (the site may block automated visitors)" : "");
 const fileName = (s: Shot) => `${String(s.ord + 1).padStart(2, "0")}-${s.label}.jpg`;
 
 function download(blob: Blob, name: string) {
@@ -54,6 +60,7 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
   const total = run.shots.length;
   const done = run.shots.filter((s) => s.status === "done").length;
   const failed = run.shots.filter((s) => s.status === "failed").length;
+  const missing = run.shots.filter((s) => s.status === "missing").length;
   const active = run.phase === "discovering" || run.phase === "capturing";
   const shownDevices = filter === "all" ? run.devices : run.devices.filter((d) => d === filter);
 
@@ -81,8 +88,9 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
         files[`${folder}/${s.site}/${s.device.replace(":", "-")}/${fileName(s)}`] = new Uint8Array(await s.blob.arrayBuffer());
       }
       const csv = [["site", "page", "device", "url", "status", "note"],
-        ...run.shots.map((s) => [s.site, s.label, s.device, s.url, s.status === "done" ? "ok" : s.status,
-          s.error ?? [s.truncated ? "cut at maximum height" : "", s.broken?.length ? `broken images on the site: ${s.broken.join(" | ")}` : ""].filter(Boolean).join("; ")])]
+        ...run.shots.map((s) => [s.site, s.label, s.device, s.url,
+          s.status === "done" ? (s.httpStatus && s.httpStatus >= 400 ? `ok (page returned ${s.httpStatus})` : "ok") : s.status === "missing" ? "not on site" : s.status,
+          s.error ?? [s.reduced ? "shortened to fit memory" : s.truncated ? "cut at maximum height" : "", s.broken?.length ? `broken images on the site: ${s.broken.join(" | ")}` : ""].filter(Boolean).join("; ")])]
         .map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
       files[`${folder}/report.csv`] = new TextEncoder().encode(csv);
       // level 0: JPEGs are already compressed, so zipping is instant
@@ -93,10 +101,13 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
     }
   }
 
+  const toCapture = total - missing;
+  const extra = [failed ? `${failed} failed` : "", missing ? `${missing} not on the site` : ""].filter(Boolean).join(", ");
   const status = run.phase === "discovering"
     ? "Finding the key pages…"
-    : active ? `Capturing ${done + failed} of ${total}`
-    : run.phase === "stopped" ? `Stopped. ${done} ready` : failed ? `Done. ${done} ready, ${failed} failed` : `Done. All ${done} ready`;
+    : active ? `Capturing ${done + failed} of ${toCapture}`
+    : run.phase === "stopped" ? `Stopped. ${done} ready`
+    : extra ? `Done. ${done} ready, ${extra}` : `Done. All ${done} ready`;
 
   return (
     <section className="mt-12">
@@ -115,7 +126,7 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
         </div>
         {active && total > 0 && (
           <div className="mt-3 h-1 overflow-hidden rounded bg-line">
-            <i className="block h-full bg-accent transition-[width] duration-500" style={{ width: `${((done + failed) / total) * 100}%` }} />
+            <i className="block h-full bg-accent transition-[width] duration-500" style={{ width: `${toCapture ? ((done + failed) / toCapture) * 100 : 0}%` }} />
           </div>
         )}
         {run.devices.length > 1 && (
@@ -137,6 +148,9 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
       {[...sites].map(([site, pages]) => (
         <div key={site} className="mb-10">
           {sites.size > 1 && <h3 className="mb-3 text-lg font-bold">{site}</h3>}
+          {run.notes?.[site] && (
+            <p className="mb-3 rounded-lg border border-line bg-surface px-4 py-2.5 text-sm text-muted">{run.notes[site]}</p>
+          )}
           {[...pages.values()].map((pg) => (
             <div key={pg.label} className="mb-3.5 rounded-2xl border border-line bg-surface px-4 pb-4 pt-3.5">
               <div className="mb-3 flex min-w-0 flex-col gap-0.5 sm:flex-row sm:items-baseline sm:gap-4">
@@ -156,6 +170,9 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
                   const caption = (
                     <span className="mt-1.5 block text-[0.8rem] text-muted">
                       {d.name}
+                      {!!s.httpStatus && s.httpStatus >= 400 && (
+                        <span className="block font-semibold text-bad">⚠ Page returned {s.httpStatus}{blockedHint(s.httpStatus)}</span>
+                      )}
                       {!!s.broken?.length && (
                         <span className="block font-semibold text-bad" title={s.broken.join("\n")}>
                           ⚠ {s.broken.length} broken image{s.broken.length > 1 ? "s" : ""} on site
@@ -176,9 +193,9 @@ export default function Results({ run, onStop }: { run: Run; onStop: () => void 
                   }
                   return (
                     <div key={id} className="shrink-0">
-                      <span style={style} className={`grid place-items-center rounded-md border p-2 text-center text-[0.78rem] ${s.status === "failed" ? "border-transparent bg-bad-soft text-bad" : "border-line bg-sunken text-muted"}`}>
-                        <span className={s.status === "failed" ? "" : "pf-pulse"}>
-                          {s.status === "failed" ? s.error : s.status === "running" ? "Capturing…" : "Waiting"}
+                      <span style={style} className={`grid place-items-center rounded-md border p-2 text-center text-[0.78rem] ${s.status === "failed" ? "border-transparent bg-bad-soft text-bad" : s.status === "missing" ? "border-dashed border-line text-muted" : "border-line bg-sunken text-muted"}`}>
+                        <span className={s.status === "failed" || s.status === "missing" ? "" : "pf-pulse"}>
+                          {s.status === "failed" || s.status === "missing" ? s.error : s.status === "running" ? "Capturing…" : "Waiting"}
                         </span>
                       </span>
                       {caption}
@@ -230,7 +247,12 @@ function Lightbox({ shots, startId, onClose }: { shots: Shot[]; startId: string;
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={s.src} alt={`${s.label} on ${devName(s.device)}`} style={{ width: Math.min(s.width ?? 1400, 1400) }}
           className="mx-auto block h-auto max-w-full rounded shadow-[0_10px_40px_rgba(0,0,0,.4)]" />
-        {s.truncated && <p className="mt-3 text-center text-sm text-[#93A0B4]">This page is very long, so the image stops at the maximum height.</p>}
+        {!!s.httpStatus && s.httpStatus >= 400 && (
+          <p className="mb-3 text-center text-sm font-semibold text-[#FFB4A3]">This page returned HTTP {s.httpStatus}{blockedHint(s.httpStatus)}: what you see is the site's error page.</p>
+        )}
+        {s.reduced
+          ? <p className="mt-3 text-center text-sm text-[#93A0B4]">The full page was too heavy to capture, so this image shows the top part only.</p>
+          : s.truncated && <p className="mt-3 text-center text-sm text-[#93A0B4]">This page is very long, so the image stops at the maximum height.</p>}
         {!!s.broken?.length && (
           <div className="mx-auto mt-4 max-w-3xl rounded-lg border border-[#5A2A22] bg-[#2A1714] p-4 text-sm text-[#FFB4A3]">
             <b className="block">These images are broken on the live site (they fail for real visitors too):</b>

@@ -4,8 +4,10 @@ import type { Device } from "./devices";
 import type { CaptureOptions } from "./options";
 import { hostIsSafe } from "./guard";
 import { singleProcess } from "./browser";
+import sharp from "sharp";
 
 const MAX_HEIGHT = Number(process.env.MAX_PAGE_HEIGHT) || 16000;
+
 // Vercel functions can return at most 4.5 MB, so images are kept under ~4.2 MB.
 const MAX_BYTES = 4_200_000;
 
@@ -114,8 +116,6 @@ async function revealLazyContent(page: Page) {
  * Waits for images, CSS background images and web fonts. On Vercel the CPU is
  * slower than on a desktop computer, so pages with 100+ lazy images need more
  * time: up to 15 seconds, then one more check for anything still loading.
- * "complete" isn't enough either: an image can be downloaded but not yet decoded
- * (turned into pixels), which still shows as a blank box, so we wait for decode too.
  */
 async function waitForVisuals(page: Page) {
   const pass = (timeoutMs: number) => page.evaluate(async (timeoutMs) => {
@@ -127,10 +127,11 @@ async function waitForVisuals(page: Page) {
       for (const m of bg.matchAll(/url\(["']?(.*?)["']?\)/g)) if (!m[1].startsWith("data:")) bgUrls.add(m[1]);
     }
     const imgs = Array.from(document.images).filter((i) => i.getAttribute("src") || i.currentSrc);
+    // Wait for downloads only. Decoding (turning files into pixels) happens slice by
+    // slice right before each capture, so the whole page is never in memory at once.
     const ready = (img: HTMLImageElement) => new Promise<void>((r) => {
-      const done = () => { img.decode().catch(() => {}).finally(() => r()); };
-      if (img.complete) return done();
-      img.addEventListener("load", done, { once: true });
+      if (img.complete) return r();
+      img.addEventListener("load", () => r(), { once: true });
       img.addEventListener("error", () => r(), { once: true });
     });
     await Promise.race([
@@ -149,6 +150,84 @@ async function waitForVisuals(page: Page) {
   if (stillLoading > 0) await pass(5_000);
 }
 
+/** Decodes only the images inside one slice, so they're drawn instead of blank. */
+async function decodeImagesBetween(page: Page, top: number, bottom: number) {
+  await page.evaluate(async (top, bottom) => {
+    const inSlice = Array.from(document.images).filter((img) => {
+      const r = img.getBoundingClientRect();
+      const y = r.top + scrollY;
+      return r.width > 0 && r.height > 0 && y < bottom && y + r.height > top;
+    });
+    await Promise.race([
+      Promise.all(inSlice.map((i) => i.decode().catch(() => {}))),
+      new Promise((r) => setTimeout(r, 4000)),
+    ]);
+  }, top, bottom).catch(() => {});
+}
+
+interface Slice { input: Buffer; top: number; left: number }
+
+/**
+ * Takes the page one screen at a time, like scrolling on a phone and taking a
+ * screenshot of each screen. Chrome only has to draw what's on screen, so memory
+ * stays flat no matter how long the page is. (Asking Chrome to draw the whole page
+ * at once is what runs out of memory on long posts.)
+ *
+ * - Fixed elements (headers, chat buttons) show in the first screen only, the same
+ *   way a full-page screenshot shows them.
+ * - Sticky elements are switched to normal positioning so they don't repeat.
+ */
+async function captureSlices(page: Page, width: number, height: number, viewportHeight: number, dpr: number): Promise<Slice[]> {
+  await page.evaluate(() => {
+    const style = document.createElement("style");
+    style.id = "pf-slice-style";
+    style.textContent = "[data-pf-sticky]{position:relative!important;top:auto!important;bottom:auto!important}"
+      + "html.pf-later-slice [data-pf-fixed]{visibility:hidden!important}";
+    document.head.appendChild(style);
+    document.querySelectorAll("body *").forEach((el) => {
+      if (getComputedStyle(el).position === "sticky") el.setAttribute("data-pf-sticky", "");
+    });
+  }).catch(() => {});
+
+  const slices: Slice[] = [];
+  for (let y = 0; y < height; y += viewportHeight) {
+    const h = Math.min(viewportHeight, height - y);
+    await page.evaluate((y) => {
+      scrollTo(0, y);
+      // Headers that only become fixed after scrolling (sticky headers) are caught here
+      if (y > 0) {
+        document.documentElement.classList.add("pf-later-slice");
+        document.querySelectorAll("body *").forEach((el) => {
+          const pos = getComputedStyle(el).position;
+          if (pos === "fixed") el.setAttribute("data-pf-fixed", "");
+          else if (pos === "sticky") el.setAttribute("data-pf-sticky", "");
+        });
+      }
+    }, y);
+    await sleep(120); // let scroll handlers and lazy loaders react
+    await decodeImagesBetween(page, y, y + h);
+    const piece = await page.screenshot({
+      type: "jpeg", quality: 92, clip: { x: 0, y, width, height: h }, optimizeForSpeed: true,
+    });
+    slices.push({ input: Buffer.from(piece), top: Math.round(y * dpr), left: 0 });
+  }
+
+  await page.evaluate(() => {
+    document.documentElement.classList.remove("pf-later-slice");
+    document.getElementById("pf-slice-style")?.remove();
+    scrollTo(0, 0);
+  }).catch(() => {});
+  return slices;
+}
+
+/** Joins the slices into one JPEG. sharp works on the compressed pieces, using little memory. */
+function joinSlices(slices: Slice[], width: number, height: number, dpr: number, quality: number) {
+  return sharp({ create: { width: Math.round(width * dpr), height: Math.round(height * dpr), channels: 3, background: "#ffffff" } })
+    .composite(slices)
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer();
+}
+
 export interface ShotResult {
   buffer: Uint8Array;
   width: number;
@@ -156,11 +235,13 @@ export interface ShotResult {
   truncated: boolean;
   /** Image addresses that failed to load on the live site (404s and similar) */
   broken: string[];
+  /** HTTP status of the page itself, e.g. 404 when the page doesn't exist */
+  httpStatus: number;
 }
 
 export async function captureShot(
   browser: Browser,
-  { url, device, opts }: { url: string; device: Device; opts: CaptureOptions },
+  { url, device, opts, heightLimit }: { url: string; device: Device; opts: CaptureOptions; heightLimit?: number },
 ): Promise<ShotResult> {
   // Normally a fresh, isolated context per screenshot. In single-process mode
   // (serverless) contexts aren't possible, so use a tab and clear everything first.
@@ -195,6 +276,9 @@ export async function captureShot(
       try { u = new URL(req.url()); } catch { return req.abort(); }
       if (u.protocol !== "http:" && u.protocol !== "https:") return req.continue();
       if (opts.blockAds && AD_HOSTS.test(u.hostname)) return req.abort("blockedbyclient");
+      // Video and audio never show in a still image but can use hundreds of MB.
+      // Video backgrounds fall back to their poster / fallback image.
+      if (req.resourceType() === "media") return req.abort("blockedbyclient");
       if (!(await hostIsSafe(u.hostname))) return req.abort("blockedbyclient");
 
       // Skip caches: the site's own HTML, CSS and JS get a unique ?pf_nocache= value,
@@ -217,7 +301,13 @@ export async function captureShot(
     page.on("request", (req) => { handle(req).catch(() => {}); });
 
     // 1. Load the page
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40_000 });
+    const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40_000 });
+    // A PDF, image or download link isn't a web page: say so instead of capturing a blank viewer
+    const contentType = response?.headers()["content-type"] ?? "";
+    if (contentType && !/html|xml/i.test(contentType)) {
+      throw new Error(`NOT_A_PAGE:${contentType.split(";")[0]}`);
+    }
+    const httpStatus = response?.status() ?? 0;
     await page.waitForNetworkIdle({ idleTime: 600, timeout: 10_000 }).catch(() => {});
 
     // 2. Behave like a visitor so delayed JavaScript (carousels, sliders...) runs
@@ -266,24 +356,25 @@ export async function captureShot(
     const pageHeight = await page.evaluate(() =>
       Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0));
     // Retina doubles every pixel, so it gets half the height to stay within limits
-    const maxHeight = opts.retina ? MAX_HEIGHT / 2 : MAX_HEIGHT;
+    const maxHeight = Math.min(heightLimit ?? Infinity, opts.retina ? MAX_HEIGHT / 2 : MAX_HEIGHT);
     const height = opts.fullPage ? Math.min(pageHeight, maxHeight) : device.height;
     const clip = { x: 0, y: 0, width: device.width, height };
 
-    // Very long pages can exceed the 4.5 MB response limit: lower JPEG quality until it fits
+    const dpr = opts.retina ? 2 : 1;
+    const slices = await captureSlices(page, clip.width, clip.height, device.height, dpr);
+    // Very long pages can exceed the 4.5 MB response limit: re-encode at lower quality
+    // until it fits (only the joining step repeats, not the capture)
     let quality = opts.quality;
-    // optimizeForSpeed: faster, lighter image encoding, which matters on tall desktop pages
-    const shoot = () => page.screenshot({ type: "jpeg", quality, clip, captureBeyondViewport: true, optimizeForSpeed: true });
-    let buffer = await shoot();
+    let buffer: Uint8Array = await joinSlices(slices, clip.width, clip.height, dpr, quality);
     while (buffer.byteLength > MAX_BYTES && quality > 40) {
       quality = Math.max(40, quality - 15);
-      buffer = await shoot();
+      buffer = await joinSlices(slices, clip.width, clip.height, dpr, quality);
     }
     if (buffer.byteLength > MAX_BYTES) {
       throw new Error("This page is too long for one image. Turn off Retina or full page and try again.");
     }
 
-    return { buffer, width: device.width, height, truncated: opts.fullPage && pageHeight > maxHeight, broken };
+    return { buffer, width: device.width, height, truncated: opts.fullPage && pageHeight > maxHeight, broken, httpStatus };
   } finally {
     if (context) {
       await context.close().catch(() => {});
@@ -293,21 +384,39 @@ export async function captureShot(
   }
 }
 
-/** Chromium died or lost its connection, usually from running out of memory. */
-export function isBrowserCrash(err: unknown) {
-  return /Target closed|Session closed|has been closed|disconnected|detached|crash|Connection closed|Protocol error/i
-    .test(String((err as Error)?.message ?? err));
+export type FailureKind = "crash" | "too-big" | "navigated" | "other";
+
+/**
+ * Sorts errors by what to do about them:
+ * - crash:     Chromium died (almost always out of memory): restart it and retry
+ * - too-big:   the image was too large to produce: retry with a shorter capture
+ * - navigated: the page reloaded or redirected itself mid-capture: just retry
+ */
+export function failureKind(err: unknown): FailureKind {
+  const m = String((err as Error)?.message ?? err);
+  if (/Target closed|Session closed|browser has disconnected|Connection closed|Page crashed|crashed|Browser closed/i.test(m)) return "crash";
+  if (/Unable to capture screenshot|out of memory|Cannot allocate|Array buffer allocation|Invalid array length|pixel limit|too long for one image/i.test(m)) return "too-big";
+  if (/Execution context was destroyed|frame was detached|Navigating frame|Cannot find context/i.test(m)) return "navigated";
+  return "other";
 }
 
 export function friendlyError(err: unknown): string {
   const m = String((err as Error)?.message ?? err).split("\n")[0];
+  if (m.startsWith("NOT_A_PAGE:")) {
+    const type = m.slice(11);
+    const kind = /pdf/.test(type) ? "a PDF file" : /image/.test(type) ? "an image file" : `a file (${type})`;
+    return `This address is ${kind}, not a web page.`;
+  }
   if (/ERR_NAME_NOT_RESOLVED/.test(m)) return "This domain could not be found.";
   if (/ERR_BLOCKED_BY_CLIENT/.test(m)) return "Blocked: this address points to a private network.";
   if (/ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED/.test(m)) return "The website refused the connection.";
   if (/ERR_CERT|SSL/.test(m)) return "The website has an SSL certificate problem.";
+  if (/ERR_ABORTED/.test(m)) return "This address is a file (like a PDF) that browsers download, not a web page.";
+  if (/ERR_TOO_MANY_REDIRECTS/.test(m)) return "The website keeps redirecting in a loop.";
   if (/timeout|timed out/i.test(m)) return "The page took too long to load.";
-  if (/too long for one image/.test(m)) return m;
-  if (isBrowserCrash(err)) return "The browser ran out of memory on this page. Try again, or turn off full page.";
-  // Show the real reason, so problems can be traced instead of guessed
+  const kind = failureKind(err);
+  if (kind === "crash") return "The browser crashed on this page, even after retrying with a shorter capture.";
+  if (kind === "too-big") return "This page is too large to capture, even at a shorter height.";
+  if (kind === "navigated") return "The page kept reloading itself during capture.";
   return `Could not capture this page (${m.slice(0, 90)}).`;
 }
